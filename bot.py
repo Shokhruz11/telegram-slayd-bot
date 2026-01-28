@@ -483,3 +483,4 @@ if __name__ == "__main__":
     init_db()
     print("🚀 Bot ishga tushdi")
     bot.polling(none_stop=True, interval=0, timeout=20)
+
