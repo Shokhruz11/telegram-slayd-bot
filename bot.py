@@ -1,1307 +1,462 @@
-# -*- coding: utf-8 -*-
-"""
-Talabalar uchun AI yordamchi Telegram bot
-
-Funksiyalar:
-- OpenAI GPT-4o-mini bilan ishlaydi (matn generatsiya)
-- Slayd (PPTX) generatsiyasi
-- Mustaqil ish / referat (DOCX) generatsiyasi
-- Kurs ishi matnlari
-- Til tanlash: uz / ru / en
-- 1 marta bepul, keyin pullik (balans, referal, to'lov cheki va h.k.)
-"""
-
-import os
-import sqlite3
-from typing import Dict, Any, Tuple, Optional, List
-
-import telebot
-from telebot import types
-from openai import OpenAI
-
-from pptx import Presentation
-from pptx.util import Pt
-from pptx.dml.color import RGBColor
-from docx import Document
-
-# ============================
-#   ASOSIY SOZLAMALAR
-# ============================
-
-# ⚠️ TOKENLARNI ENV ORQALI BERAMIZ
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()          # BotFather tokeni
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-BOT_USERNAME = os.getenv("BOT_USERNAME", "Talabalar_xizmatbot")
-
-# Admin ID – sening Telegram ID'ing (butun son).
-# Agar ADMIN_ID env berilmasa, default qiymat ishlatiladi.
-def _get_int_env(name: str, default: int) -> int:
-    try:
-        value = os.getenv(name)
-        if value is None or value.strip() == "":
-            return default
-        return int(value.strip())
-    except Exception:
-        return default
-
-
-ADMIN_ID: int = _get_int_env("ADMIN_ID", 5754599655)
-
-# To'lov ma'lumotlari
-CARD_NUMBER = os.getenv("CARD_NUMBER", "4790 9200 1858 5070")
-CARD_OWNER = os.getenv("CARD_OWNER", "Qo'chqorov Shohruz")
-
-# Narx / limit
-PRICE_PER_USE: int = _get_int_env("PRICE_PER_USE", 5000)     # so'm
-MAX_LIST_SLAYD: int = _get_int_env("MAX_LIST_SLAYD", 20)     # maksimal list/bet
-
-# Start uchun logotip (telegram file_id)
-LOGO_FILE_ID = os.getenv("LOGO_FILE_ID", "").strip()
-
-# Token tekshiruvi
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "❌ BOT_TOKEN env topilmadi.\n"
-        "Railway (yoki .env) ichida BOT_TOKEN ni o'rnatib qo'ying."
-    )
-
-if not OPENAI_API_KEY:
-    print("⚠️ OGОHLANTIRISH: OPENAI_API_KEY topilmadi. AI funksiyalari ishlamaydi.")
-
-# Telegram bot
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
-
-# OpenAI client
-client: Optional[OpenAI] = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-# ============================
-#   MA'LUMOTLAR BAZASI
-# ============================
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "bot.db")
-
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute(
-    """
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id INTEGER UNIQUE,
-    username TEXT,
-    full_name TEXT,
-    free_uses INTEGER DEFAULT 1,          -- 1 marta bepul
-    paid_uses INTEGER DEFAULT 0,          -- to'langan foydalanishlar
-    referral_uses INTEGER DEFAULT 0,      -- referal orqali olingan
-    referrals_count INTEGER DEFAULT 0,    -- nechta odamni taklif qilgan
-    referral_code TEXT,
-    referred_by INTEGER                   -- kim orqali kelgani (telegram_id)
-)
-"""
-)
-conn.commit()
-
-# language ustuni yo'qligini tekshirib, bo'lmasa qo'shamiz
-try:
-    cursor.execute("ALTER TABLE users ADD COLUMN language TEXT")
-    conn.commit()
-except sqlite3.OperationalError:
-    # allaqachon mavjud bo'lsa xato chiqadi – e'tibor bermaymiz
-    pass
-
-# foydalanuvchi holatlari (slayd, mustaqil ish, chek va h.k.)
-user_states: Dict[int, Dict[str, Any]] = {}
-
-
-# ============================
-#   TIL FUNKSIYALARI
-# ============================
-
-def get_user_language(tg_id: int) -> str:
-    cursor.execute("SELECT language FROM users WHERE telegram_id = ?", (tg_id,))
-    row = cursor.fetchone()
-    if not row or not row[0]:
-        return "uz"
-    return row[0]
-
-
-def set_user_language(tg_id: int, lang: str) -> None:
-    cursor.execute(
-        "UPDATE users SET language = ? WHERE telegram_id = ?",
-        (lang, tg_id),
-    )
-    conn.commit()
-
-
-def language_label(lang: str) -> str:
-    if lang == "ru":
-        return "Русский"
-    if lang == "en":
-        return "English"
-    return "O‘zbekcha"
-
-
-# ============================
-#   USER / BALANS / REFERRAL
-# ============================
-
-def generate_referral_code(telegram_id: int) -> str:
-    return f"REF{telegram_id}"
-
-
-def get_user_by_tg_id(tg_id: int):
-    cursor.execute("SELECT * FROM users WHERE telegram_id = ?", (tg_id,))
-    return cursor.fetchone()
-
-
-def get_user_by_ref_code(code: str):
-    cursor.execute("SELECT * FROM users WHERE referral_code = ?", (code,))
-    return cursor.fetchone()
-
-
-def ensure_user(tg_user, ref_code_from_start: Optional[str] = None):
-    """
-    Foydalanuvchini bazadan topadi, bo'lmasa yaratadi.
-    Agar /start orqali referal kod bilan kirgan bo'lsa, uni qayd etadi.
-    """
-    tg_id = tg_user.id
-    username = tg_user.username or ""
-    full_name = (tg_user.first_name or "") + " " + (tg_user.last_name or "")
-
-    user = get_user_by_tg_id(tg_id)
-    if user is None:
-        referral_code = generate_referral_code(tg_id)
-        cursor.execute(
-            """
-            INSERT INTO users (telegram_id, username, full_name, referral_code, language)
-            VALUES (?, ?, ?, ?, ?)
-        """,
-            (tg_id, username, full_name.strip(), referral_code, "uz"),
-        )
-        conn.commit()
-
-        # Referal kod orqali kelgan bo'lsa
-        if ref_code_from_start:
-            inviter = get_user_by_ref_code(ref_code_from_start)
-            if inviter:
-                inviter_tg_id = inviter[1]  # 1-ustun: telegram_id
-                if inviter_tg_id != tg_id:  # o'zini o'zi taklif qilmasin
-                    cursor.execute(
-                        "UPDATE users SET referred_by = ? WHERE telegram_id = ?",
-                        (inviter_tg_id, tg_id),
-                    )
-                    cursor.execute(
-                        """
-                        UPDATE users
-                        SET referrals_count = referrals_count + 1
-                        WHERE telegram_id = ?
-                    """,
-                        (inviter_tg_id,),
-                    )
-                    conn.commit()
-
-                    # Har 2 ta referal uchun 1 ta bepul foydalanish
-                    cursor.execute(
-                        """
-                        SELECT referrals_count, referral_uses
-                        FROM users WHERE telegram_id = ?
-                    """,
-                        (inviter_tg_id,),
-                    )
-                    r_count, r_uses = cursor.fetchone()
-                    if r_count % 2 == 0:
-                        cursor.execute(
-                            """
-                            UPDATE users
-                            SET referral_uses = referral_uses + 1
-                            WHERE telegram_id = ?
-                        """,
-                            (inviter_tg_id,),
-                        )
-                        conn.commit()
-                        try:
-                            bot.send_message(
-                                inviter_tg_id,
-                                "🎉 Tabriklaymiz! Siz 2 ta do'stni taklif qildingiz.\n"
-                                "Sizga 1 marta bepul foydalanish qo‘shildi! 🎁",
-                            )
-                        except Exception:
-                            pass
-
-        user = get_user_by_tg_id(tg_id)
-    else:
-        cursor.execute(
-            """
-            UPDATE users SET username = ?, full_name = ? WHERE telegram_id = ?
-        """,
-            (username, full_name.strip(), tg_id),
-        )
-        conn.commit()
-        user = get_user_by_tg_id(tg_id)
-
-    return user
-
-
-def consume_credit(telegram_id: int) -> Tuple[bool, Optional[str]]:
-    """
-    Foydalanuvchidan bitta 'foydalanish huquqi' (kredit) yechadi.
-    Tartib:
-        1) free_uses
-        2) referral_uses
-        3) paid_uses
-    """
-    cursor.execute(
-        "SELECT free_uses, referral_uses, paid_uses FROM users WHERE telegram_id = ?",
-        (telegram_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        return False, None
-
-    free_uses, ref_uses, paid_uses = row
-
-    if free_uses > 0:
-        cursor.execute(
-            "UPDATE users SET free_uses = free_uses - 1 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        conn.commit()
-        return True, "free"
-
-    if ref_uses > 0:
-        cursor.execute(
-            "UPDATE users SET referral_uses = referral_uses - 1 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        conn.commit()
-        return True, "referral"
-
-    if paid_uses > 0:
-        cursor.execute(
-            "UPDATE users SET paid_uses = paid_uses - 1 WHERE telegram_id = ?",
-            (telegram_id,),
-        )
-        conn.commit()
-        return True, "paid"
-
-    return False, None
-
-
-def add_paid_uses(telegram_id: int, count: int) -> None:
-    cursor.execute(
-        "UPDATE users SET paid_uses = paid_uses + ? WHERE telegram_id = ?",
-        (count, telegram_id),
-    )
-    conn.commit()
-
-
-def get_balance_text(telegram_id: int) -> str:
-    cursor.execute(
-        """
-        SELECT free_uses, referral_uses, paid_uses, referrals_count
-        FROM users WHERE telegram_id = ?
-    """,
-        (telegram_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        return "Foydalanuvchi topilmadi."
-
-    free_uses, ref_uses, paid_uses, ref_count = row
-    total = free_uses + ref_uses + paid_uses
-    text = (
-        "💰 *Balans ma'lumotlari:*\n\n"
-        f"▫️ Birinchi bepul foydalanish: {free_uses} ta\n"
-        f"▫️ Referal orqali olingan bepul foydalanishlar: {ref_uses} ta\n"
-        f"▫️ To'langan foydalanishlar: {paid_uses} ta\n"
-        f"▫️ Jami foydalanish imkoniyati: {total} ta\n\n"
-        f"👥 Siz taklif qilgan do'stlar soni: {ref_count} ta\n"
-        f"💸 20 listgacha slayd / mustaqil ish / referat narxi: {PRICE_PER_USE} so'm\n"
-    )
-    return text
-
-
-def get_referral_info_text(tg_id: int) -> str:
-    cursor.execute(
-        """
-        SELECT referral_code, referrals_count, referral_uses
-        FROM users WHERE telegram_id = ?
-    """,
-        (tg_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        return "Foydalanuvchi topilmadi."
-
-    code, r_count, r_uses = row
-    if not code:
-        code = generate_referral_code(tg_id)
-        cursor.execute(
-            "UPDATE users SET referral_code = ? WHERE telegram_id = ?",
-            (code, tg_id),
-        )
-        conn.commit()
-
-    link = f"https://t.me/{BOT_USERNAME}?start={code}"
-    handle = f"@{BOT_USERNAME}"
-    text = (
-        "📎 *Referal tizimi – do'st taklif qilib bonus oling!*\n\n"
-        f"Bot nomi: {handle}\n\n"
-        "Ushbu havolani do'stlaringizga yuboring. Har *2 ta* do'stingiz "
-        "sizning havolangiz orqali botga /start bossa, sizga *1 marta bepul* "
-        "foydalanish qo'shiladi.\n\n"
-        f"🔗 Sizning referal havolangiz:\n`{link}`\n\n"
-        f"👥 Hozirga qadar taklif qilgan do'stlaringiz: {r_count} ta\n"
-        f"🎁 Referal orqali olingan bepul foydalanishlar: {r_uses} ta\n"
-    )
-    return text
-
-
-# ============================
-#   AI FUNKSIYASI (OpenAI)
-# ============================
-
-def ask_gpt(prompt: str, lang: str) -> str:
-    """
-    OpenAI GPT-4o-mini orqali javob olish.
-    """
-    if client is None:
-        return (
-            "❗️ AI kaliti (OPENAI_API_KEY) topilmadi. Iltimos, admin bilan bog‘laning."
-        )
-
-    if lang == "ru":
-        lang_desc = "Russian"
-    elif lang == "en":
-        lang_desc = "English"
-    else:
-        lang_desc = "Uzbek"
-
-    system_text = (
-        "You are an AI assistant that helps students generate educational texts: "
-        "slides content, coursework, independent assignments, essays, summaries and tests. "
-        "Always write in a clear, academic style appropriate for university and college students. "
-        f"All answers must be written in {lang_desc} language. "
-        "Do not switch to other languages."
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_text},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        print("OpenAI xato:", e)
-        return "❗️ AI xizmatida kutilmagan xatolik yuz berdi. Birozdan so‘ng qayta urinib ko‘ring."
-
-
-# ============================
-#   PPTX / DOCX GENERATORLAR
-# ============================
-
-def parse_slides_from_text(text: str) -> List[Dict[str, Any]]:
-    """
-    GPT qaytargan matndan slaydlar ro'yxatini ajratib oladi.
-    Format: SLIDE 1, SLIDE 2, SLAYD 1 va h.k.
-    """
-    lines = text.replace("\r", "").split("\n")
-    slides: List[Dict[str, Any]] = []
-    current: Dict[str, Any] = {"title": "", "bullets": []}
-
-    def push_current():
-        if current["title"] or current["bullets"]:
-            slides.append(
-                {
-                    "title": current["title"].strip() or "Slide",
-                    "bullets": [b.strip() for b in current["bullets"] if b.strip()],
-                }
-            )
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        upper = stripped.upper()
-        if upper.startswith("SLIDE") or upper.startswith("SLAYD"):
-            # yangi slayd
-            push_current()
-            current = {"title": "", "bullets": []}  # type: ignore[assignment]
-            parts = stripped.split(":", 1)
-            if len(parts) == 2:
-                current["title"] = parts[1]
-            else:
-                current["title"] = ""
-        elif stripped.startswith(("-", "•", "*")):
-            current["bullets"].append(stripped.lstrip("-•* ").strip())
-        else:
-            if not current["title"]:
-                current["title"] = stripped
-            else:
-                current["bullets"].append(stripped)
-
-    push_current()
-
-    if not slides:
-        slides = [
-            {
-                "title": "Slayd",
-                "bullets": [line for line in lines if line.strip()],
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Red Deploy</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        body {
+            background-color: #0a0e17;
+            color: #e2e8f0;
+            line-height: 1.6;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #2d3748;
+        }
+        
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .logo i {
+            color: #ff4757;
+            font-size: 24px;
+        }
+        
+        .logo h1 {
+            font-size: 28px;
+            font-weight: 700;
+            background: linear-gradient(90deg, #ff4757, #ff6b81);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .weather {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(255, 71, 87, 0.1);
+            padding: 8px 15px;
+            border-radius: 20px;
+            border: 1px solid #ff4757;
+        }
+        
+        .weather i {
+            color: #ffd700;
+        }
+        
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 30px;
+        }
+        
+        .sidebar {
+            background: #1a202c;
+            border-radius: 12px;
+            padding: 25px;
+            border: 1px solid #2d3748;
+        }
+        
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #ff6b81;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .section-title i {
+            font-size: 16px;
+        }
+        
+        .architecture-list {
+            list-style: none;
+            margin-bottom: 30px;
+        }
+        
+        .architecture-list li {
+            padding: 12px 0;
+            border-bottom: 1px solid #2d3748;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .architecture-list li:last-child {
+            border-bottom: none;
+        }
+        
+        .badge {
+            background: linear-gradient(90deg, #ff4757, #ff6b81);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        
+        hr {
+            border: none;
+            height: 1px;
+            background-color: #2d3748;
+            margin: 25px 0;
+        }
+        
+        .chat-preview {
+            background: rgba(255, 107, 129, 0.05);
+            border-radius: 10px;
+            padding: 15px;
+            border: 1px solid #2d3748;
+            margin-top: 20px;
+        }
+        
+        .chat-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 14px;
+            color: #a0aec0;
+        }
+        
+        .chat-message {
+            color: #e2e8f0;
+            font-size: 15px;
+        }
+        
+        .deployments {
+            background: #1a202c;
+            border-radius: 12px;
+            padding: 25px;
+            border: 1px solid #2d3748;
+        }
+        
+        .deployment-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+        }
+        
+        .status-badge {
+            padding: 6px 15px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .active {
+            background-color: rgba(72, 187, 120, 0.2);
+            color: #48bb78;
+            border: 1px solid #48bb78;
+        }
+        
+        .failed {
+            background-color: rgba(245, 101, 101, 0.2);
+            color: #f56565;
+            border: 1px solid #f56565;
+        }
+        
+        .deployment-card {
+            background: #0a0e17;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 25px;
+            border: 1px solid #2d3748;
+        }
+        
+        .deployment-time {
+            color: #a0aec0;
+            font-size: 14px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .deployment-time i {
+            color: #ff6b81;
+        }
+        
+        .deployment-status {
+            font-weight: 600;
+            margin: 15px 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .success {
+            color: #48bb78;
+        }
+        
+        .failure {
+            color: #f56565;
+        }
+        
+        .btn {
+            background: transparent;
+            color: #ff6b81;
+            border: 1px solid #ff6b81;
+            padding: 8px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            text-decoration: none;
+        }
+        
+        .btn:hover {
+            background: rgba(255, 107, 129, 0.1);
+        }
+        
+        .build-steps {
+            margin-top: 20px;
+            padding-left: 20px;
+        }
+        
+        .build-step {
+            margin-bottom: 15px;
+            position: relative;
+            padding-left: 30px;
+        }
+        
+        .build-step:before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 8px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background-color: #2d3748;
+        }
+        
+        .build-step.failed:before {
+            background-color: #f56565;
+        }
+        
+        .build-step.success:before {
+            background-color: #48bb78;
+        }
+        
+        .build-step.neutral:before {
+            background-color: #a0aec0;
+        }
+        
+        .step-time {
+            color: #a0aec0;
+            font-size: 13px;
+            margin-left: 10px;
+        }
+        
+        .error-details {
+            background: rgba(245, 101, 101, 0.1);
+            border-left: 3px solid #f56565;
+            padding: 15px;
+            margin-top: 15px;
+            border-radius: 0 6px 6px 0;
+            font-size: 14px;
+        }
+        
+        .error-details i {
+            color: #f56565;
+            margin-right: 8px;
+        }
+        
+        footer {
+            margin-top: 40px;
+            text-align: center;
+            color: #a0aec0;
+            font-size: 14px;
+            padding-top: 20px;
+            border-top: 1px solid #2d3748;
+        }
+        
+        @media (max-width: 968px) {
+            .main-content {
+                grid-template-columns: 1fr;
             }
-        ]
-    return slides
-
-
-def apply_design_to_slide(slide, design: str) -> None:
-    """
-    Dizayn raqamiga qarab slaydga sodda stil berish.
-    """
-    title_shape = slide.shapes.title
-    body = None
-    if len(slide.placeholders) > 1:
-        body = slide.placeholders[1].text_frame
-
-    if title_shape and title_shape.text_frame.paragraphs:
-        p = title_shape.text_frame.paragraphs[0]
-        p.font.bold = True
-        if design == "1":
-            p.font.size = Pt(40)
-        elif design == "2":
-            p.font.size = Pt(34)
-        elif design == "3":
-            p.font.size = Pt(32)
-        else:
-            p.font.size = Pt(36)
-
-    if body:
-        for p in body.paragraphs:
-            p.font.size = Pt(22)
-
-    fill = slide.background.fill
-    fill.solid()
-
-    if design == "1":
-        fill.fore_color.rgb = RGBColor(255, 255, 255)
-    elif design == "2":
-        fill.fore_color.rgb = RGBColor(230, 242, 255)
-    elif design == "3":
-        fill.fore_color.rgb = RGBColor(242, 242, 242)
-    elif design == "4":
-        fill.fore_color.rgb = RGBColor(255, 242, 204)
-    elif design == "5":
-        fill.fore_color.rgb = RGBColor(226, 239, 218)
-    else:
-        fill.fore_color.rgb = RGBColor(237, 237, 255)
-
-
-def create_pptx_from_text(text: str, design: str, filename: str) -> None:
-    prs = Presentation()
-    slides = parse_slides_from_text(text)
-
-    for sl in slides:
-        layout = prs.slide_layouts[1]  # title + content
-        slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = sl["title"]
-
-        body = slide.placeholders[1].text_frame
-        body.clear()
-        first = True
-        for bullet in sl["bullets"]:
-            if first and body.paragraphs:
-                p = body.paragraphs[0]
-                first = False
-            else:
-                p = body.add_paragraph()
-            p.text = bullet
-            p.level = 0
-
-        apply_design_to_slide(slide, design)
-
-    prs.save(filename)
-
-
-def create_docx_from_text(text: str, filename: str, title: Optional[str] = None) -> None:
-    doc = Document()
-    if title:
-        doc.add_heading(title, level=1)
-        doc.add_paragraph()
-
-    for block in text.replace("\r", "").split("\n\n"):
-        block = block.strip()
-        if not block:
-            continue
-        doc.add_paragraph(block)
-
-    doc.save(filename)
-
-
-# ============================
-#   MENYU
-# ============================
-
-def main_menu_keyboard(_tg_id: Optional[int] = None):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("📝 Slayd", "📚 Kurs ishi")
-    kb.row("📄 Mustaqil ish / Referat", "👨‍🏫 Profi jamoa")
-    kb.row("🎁 Referal bonus", "💰 Balans")
-    kb.row("💵 To‘lov / Hisob", "🌐 Til / Language", "❓ Yordam")
-    return kb
-
-
-# ============================
-#   /START
-# ============================
-
-@bot.message_handler(commands=["start"])
-def cmd_start(message: telebot.types.Message):
-    parts = message.text.split()
-    ref_code = parts[1] if len(parts) > 1 else None
-
-    ensure_user(message.from_user, ref_code_from_start=ref_code)
-    lang = get_user_language(message.from_user.id)
-
-    welcome_text = (
-        "👋 *Assalomu alaykum, Talabalar Xizmati botiga xush kelibsiz!* \n\n"
-        "Bu bot orqali siz ta’lim topshiriqlaringizni AI yordamida tez va sifatli "
-        "tayyorlashingiz mumkin:\n\n"
-        "▫️ Slayd (PPTX) matni va fayli\n"
-        "▫️ Mustaqil ish va referat (DOCX)\n"
-        "▫️ Kurs ishi uchun ilmiy matnlar\n"
-        "▫️ Testlar, esse va boshqa topshiriqlar\n\n"
-        "🆓 *Yangi foydalanuvchi* sifatida sizga *1 marta BEPUL* foydalanish beriladi.\n"
-        f"Keyingi har bir xizmat (20 listgacha slayd / mustaqil ish / referat) narxi: "
-        f"*{PRICE_PER_USE} so'm*.\n\n"
-        f"🔤 Joriy til: *{language_label(lang)}*\n"
-        "Tilni o‘zgartirish uchun: 🌐 Til / Language tugmasini bosing.\n\n"
-        "Quyidagi menyudan kerakli bo‘limni tanlang 👇"
-    )
-
-    if LOGO_FILE_ID:
-        bot.send_photo(
-            message.chat.id,
-            LOGO_FILE_ID,
-            caption=welcome_text,
-            reply_markup=main_menu_keyboard(message.from_user.id),
-        )
-    else:
-        bot.send_message(
-            message.chat.id,
-            welcome_text,
-            reply_markup=main_menu_keyboard(message.from_user.id),
-        )
-
-
-# ============================
-#   TIL MENYUSI
-# ============================
-
-@bot.message_handler(commands=["language"])
-@bot.message_handler(func=lambda m: m.text == "🌐 Til / Language")
-def cmd_language(message: telebot.types.Message):
-    ensure_user(message.from_user)
-    current_lang = get_user_language(message.from_user.id)
-
-    kb = types.InlineKeyboardMarkup()
-    kb.add(
-        types.InlineKeyboardButton("🇺🇿 O‘zbekcha", callback_data="set_lang_uz"),
-        types.InlineKeyboardButton("🇷🇺 Русский", callback_data="set_lang_ru"),
-        types.InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_en"),
-    )
-
-    text = (
-        "🌐 *Tilni tanlang / Choose language:*\n\n"
-        f"Joriy til: *{language_label(current_lang)}*"
-    )
-    bot.send_message(message.chat.id, text, reply_markup=kb)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("set_lang_"))
-def callback_set_language(call: telebot.types.CallbackQuery):
-    lang_code = call.data.split("_")[-1]
-    if lang_code not in ("uz", "ru", "en"):
-        bot.answer_callback_query(call.id, "Xatolik!")
-        return
-
-    set_user_language(call.from_user.id, lang_code)
-    bot.answer_callback_query(call.id, "Til yangilandi ✅")
-
-    txt = "✅ Til yangilandi: *" + language_label(lang_code) + "*"
-    bot.edit_message_text(
-        txt,
-        chat_id=call.message.chat.id,
-        message_id=call.message.message_id,
-    )
-    bot.send_message(
-        call.message.chat.id,
-        "Endi AI tomonidan yaratiladigan barcha matnlar shu tilda bo‘ladi.",
-        reply_markup=main_menu_keyboard(call.from_user.id),
-    )
-
-
-# ============================
-#   BALANS / REFERAL / YORDAM
-# ============================
-
-@bot.message_handler(commands=["balans"])
-@bot.message_handler(func=lambda m: m.text == "💰 Balans")
-def handle_balance(message: telebot.types.Message):
-    ensure_user(message.from_user)
-    text = get_balance_text(message.from_user.id)
-    bot.send_message(message.chat.id, text)
-
-
-@bot.message_handler(commands=["referral"])
-@bot.message_handler(func=lambda m: m.text == "🎁 Referal bonus")
-def handle_referral(message: telebot.types.Message):
-    ensure_user(message.from_user)
-    text = get_referral_info_text(message.from_user.id)
-    bot.send_message(message.chat.id, text)
-
-
-@bot.message_handler(commands=["help"])
-@bot.message_handler(func=lambda m: m.text == "❓ Yordam")
-def cmd_help(message: telebot.types.Message):
-    help_text = (
-        "❓ *Yordam bo‘limi*\n\n"
-        "Bot imkoniyatlari:\n"
-        "1️⃣ *Slayd* – mavzu, dizayn va list soni bo‘yicha slaydlar uchun matn va PPTX fayl.\n"
-        "2️⃣ *Mustaqil ish / referat* – DOCX faylga tushirilgan matn.\n"
-        "3️⃣ *Kurs ishi* – kurs ishi rejasi va bo‘limlari bo‘yicha ilmiy matn.\n"
-        "4️⃣ *Profi jamoa* – katta ishlar (kurs ishi, malakaviy ish, diplom)ni to‘liq tayyorlatish.\n"
-        "5️⃣ *Referal bonus* – do‘st taklif qilib, bepul foydalanish olish.\n"
-        "6️⃣ *Balans* – sizda nechta foydalanish imkoniyati borligini ko‘rish.\n"
-        "7️⃣ *To‘lov / Hisob* – karta ma’lumotlari va avtomatik hisob-kitob.\n"
-        "8️⃣ *Til / Language* – AI matnlarini qaysi tilda yozishni tanlash.\n\n"
-        "To‘lov cheki *screenshot* ko‘rinishida yuboriladi (/chek).\n"
-        "Savollar bo‘lsa admin bilan bog‘laning: @Shokhruz11"
-    )
-    bot.send_message(
-        message.chat.id,
-        help_text,
-        reply_markup=main_menu_keyboard(message.from_user.id),
-    )
-
-
-# ============================
-#   TO'LOV / HISOB
-# ============================
-
-@bot.message_handler(func=lambda m: m.text == "💵 To‘lov / Hisob")
-def handle_payment_button(message: telebot.types.Message):
-    text = (
-        "💵 *To'lov va hisob-kitob bo‘limi*\n\n"
-        f"Har bir xizmat narxi: *{PRICE_PER_USE} so'm*\n"
-        f"(20 listgacha *slayd / mustaqil ish / referat* uchun).\n\n"
-        "To‘lovni quyidagi kartaga amalga oshiring:\n"
-        f"▫️ Karta: `{CARD_NUMBER}`\n"
-        f"▫️ Egasi: *{CARD_OWNER}*\n\n"
-        "To‘lovdan so‘ng /chek buyrug‘i orqali chek *screenshot* yuboring.\n"
-        "Admin (@Shokhruz11) tasdiqlagach, balansingizga xizmat qo‘shiladi.\n\n"
-        "👇 Nechta foydalanish uchun to‘lov qilmoqchi ekanligingizni tanlasangiz, "
-        "bot jami summani avtomatik hisoblab beradi."
-    )
-
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("1 ta foydalanish", callback_data="calc_uses_1"),
-        types.InlineKeyboardButton("2 ta", callback_data="calc_uses_2"),
-    )
-    kb.row(
-        types.InlineKeyboardButton("5 ta", callback_data="calc_uses_5"),
-        types.InlineKeyboardButton("10 ta", callback_data="calc_uses_10"),
-    )
-
-    bot.send_message(message.chat.id, text, reply_markup=kb)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("calc_uses_"))
-def callback_calc_uses(call: telebot.types.CallbackQuery):
-    try:
-        uses = int(call.data.split("_")[-1])
-    except ValueError:
-        bot.answer_callback_query(call.id, "Xatolik!")
-        return
-
-    total = uses * PRICE_PER_USE
-    msg = (
-        f"📊 *Hisob-kitob:*\n\n"
-        f"▫️ Foydalanish soni: *{uses} ta*\n"
-        f"▫️ Bir martalik narx: *{PRICE_PER_USE} so'm*\n"
-        f"➡️ Jami to'lov: *{total} so'm*\n\n"
-        "To‘lovni amalga oshirgach, /chek buyrug‘i orqali chek screenshotini yuboring."
-    )
-
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, msg)
-
-
-# ============================
-#   /CHEK – TO'LOV CHEKI
-# ============================
-
-@bot.message_handler(commands=["chek"])
-def cmd_chek(message: telebot.types.Message):
-    ensure_user(message.from_user)
-    tg_id = message.from_user.id
-
-    user_states[tg_id] = {"mode": "chek"}
-
-    bot.send_message(
-        message.chat.id,
-        "🧾 *To'lov cheki*\n\n"
-        "Iltimos, to‘lov chekini *screenshot (rasm)* ko‘rinishida yuboring.\n"
-        "Agar xohlasangiz, qo‘shimcha ravishda matn ham yozishingiz mumkin.\n\n"
-        "Chekingiz admin (@Shokhruz11) tomonidan ko‘rib chiqiladi. "
-        "Tasdiqlangach, balansingizga foydalanish huquqi qo‘shiladi.",
-    )
-
-
-@bot.message_handler(
-    func=lambda m: user_states.get(m.from_user.id, {}).get("mode") == "chek",
-    content_types=["photo", "text"],
-)
-def handle_chek_flow(message: telebot.types.Message):
-    tg_id = message.from_user.id
-    username = (
-        "@" + message.from_user.username
-        if message.from_user.username
-        else str(tg_id)
-    )
-
-    header = (
-        "🧾 *Yangi to'lov cheki!*\n\n"
-        f"Foydalanuvchi: {username}\n"
-        f"Telegram ID: `{tg_id}`\n\n"
-        "Tasdiqlash uchun quyidagi tugmalardan birini bosing 👇\n"
-        "(balansga nechta foydalanish qo'shilishini tanlang)"
-    )
-
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton(
-            "✅ 1 ta foydalanish", callback_data=f"approve_{tg_id}_1"
-        ),
-        types.InlineKeyboardButton(
-            "✅ 3 ta", callback_data=f"approve_{tg_id}_3"
-        ),
-    )
-    kb.row(
-        types.InlineKeyboardButton(
-            "✅ 5 ta", callback_data=f"approve_{tg_id}_5"
-        ),
-    )
-
-    try:
-        if ADMIN_ID:
-            if message.content_type == "photo":
-                photo = message.photo[-1]
-                bot.send_photo(
-                    ADMIN_ID,
-                    photo.file_id,
-                    caption=header,
-                    reply_markup=kb,
-                )
-            else:
-                text = message.text or "(matn bo'sh)"
-                caption = header + "\n\nMatn:\n" + text
-                bot.send_message(
-                    ADMIN_ID,
-                    caption,
-                    reply_markup=kb,
-                )
-
-        bot.send_message(
-            message.chat.id,
-            "✅ Rahmat! Chekingiz admin ga yuborildi.\n"
-            "Tasdiqlangach, balansingiz yangilanadi.",
-        )
-    except Exception as e:
-        print("Chek forwarding xatosi:", e)
-        bot.send_message(
-            message.chat.id,
-            "❗️ Chek ma'lumotini admin ga yuborishda xatolik yuz berdi. "
-            "Keyinroq qayta urinib ko‘ring.",
-        )
-
-    user_states.pop(tg_id, None)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_"))
-def callback_approve_payment(call: telebot.types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "Faqat admin tasdiqlashi mumkin.")
-        return
-
-    _, user_id_str, uses_str = call.data.split("_")
-    try:
-        target_id = int(user_id_str)
-        uses = int(uses_str)
-    except ValueError:
-        bot.answer_callback_query(call.id, "Xatolik!")
-        return
-
-    cursor.execute(
-        "SELECT telegram_id FROM users WHERE telegram_id = ?",
-        (target_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        bot.answer_callback_query(call.id, "Foydalanuvchi topilmadi.")
-        return
-
-    add_paid_uses(target_id, uses)
-    bot.answer_callback_query(call.id, f"{uses} ta foydalanish qo'shildi ✅")
-
-    # Admin xabarini yangilash
-    try:
-        if call.message.content_type == "text":
-            new_text = (
-                call.message.text
-                + f"\n\n✅ Admin tasdiqladi: {uses} ta foydalanish qo'shildi."
-            )
-            bot.edit_message_text(
-                new_text,
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-            )
-        else:
-            new_caption = (
-                (call.message.caption or "")
-                + f"\n\n✅ Admin tasdiqladi: {uses} ta foydalanish qo'shildi."
-            )
-            bot.edit_message_caption(
-                new_caption,
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-            )
-    except Exception as e:
-        print("Approve edit xatosi:", e)
-
-    # Foydalanuvchini xabardor qilish
-    try:
-        bot.send_message(
-            target_id,
-            f"💳 To‘lovingiz admin tomonidan tasdiqlandi.\n"
-            f"Balansingizga *{uses} ta* foydalanish qo‘shildi.",
-        )
-    except Exception as e:
-        print("User notify xatosi:", e)
-
-
-# ============================
-#   ADMIN BUYRUQLARI
-# ============================
-
-@bot.message_handler(commands=["add_uses"])
-def cmd_add_uses(message: telebot.types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.split()
-    if len(parts) != 3:
-        bot.send_message(message.chat.id, "Format: /add_uses <telegram_id> <soni>")
-        return
-
-    try:
-        target_id = int(parts[1])
-        count = int(parts[2])
-    except ValueError:
-        bot.send_message(message.chat.id, "ID va soni butun son bo‘lishi kerak.")
-        return
-
-    cursor.execute(
-        "SELECT paid_uses FROM users WHERE telegram_id = ?",
-        (target_id,),
-    )
-    row = cursor.fetchone()
-    if row is None:
-        bot.send_message(message.chat.id, "Bunday foydalanuvchi topilmadi.")
-        return
-
-    add_paid_uses(target_id, count)
-
-    bot.send_message(
-        message.chat.id, f"✅ Foydalanuvchiga {count} ta foydalanish qo‘shildi."
-    )
-    try:
-        bot.send_message(
-            target_id, f"💳 Balansingizga {count} ta foydalanish qo‘shildi."
-        )
-    except Exception:
-        pass
-
-
-# ============================
-#   PROFI JAMOA / KURS ISHI / MUSTAQIL ISH
-# ============================
-
-@bot.message_handler(func=lambda m: m.text == "👨‍🏫 Profi jamoa")
-def handle_prof_team(message: telebot.types.Message):
-    text = (
-        "👨‍🏫 *Professional jamoa – kurs ishi va diplom ishlari*\n\n"
-        "Kurs ishi, malakaviy ish, diplom ishi, dissertatsiya va boshqa "
-        "katta ilmiy ishlarni *to‘liq tayyorlatish* bo‘yicha professional "
-        "yordam kerak bo‘lsa, to‘g‘ridan-to‘gri admin bilan bog‘laning:\n\n"
-        "📞 Telegram: @Shokhruz11\n\n"
-        "Barcha shartlar, muddat va narxlar *faqat admin bilan kelishilgan holda* belgilanadi."
-    )
-    bot.send_message(message.chat.id, text)
-
-
-@bot.message_handler(func=lambda m: m.text == "📚 Kurs ishi")
-def handle_kurs_ishi(message: telebot.types.Message):
-    ensure_user(message.from_user)
-    bot.send_message(
-        message.chat.id,
-        "📚 Kurs ishingiz *to‘liq mavzusi*ni va agar bo‘lsa, talablari / kafedra "
-        "ko‘rsatmalarini yozib yuboring.\n\n"
-        "Agar kurs ishini to‘liq tayyorlatmoqchi bo‘lsangiz, "
-        "👨‍🏫 *Profi jamoa* bo‘limi orqali @Shokhruz11 bilan bog‘lanishingiz mumkin.",
-    )
-    bot.register_next_step_handler(message, process_kurs_ishi_topic)
-
-
-def process_kurs_ishi_topic(message: telebot.types.Message):
-    topic = message.text
-    tg_id = message.from_user.id
-    ensure_user(message.from_user)
-
-    ok, _src = consume_credit(tg_id)
-    if not ok:
-        bot.send_message(
-            message.chat.id,
-            "❗️ Sizda bepul yoki to‘langan foydalanishlar qolmadi.\n"
-            "Iltimos, *To‘lov / Hisob* bo‘limi orqali balansni to‘ldiring "
-            "yoki *Referal bonus* bo‘limi orqali bepul foydalanish oling.",
-        )
-        return
-
-    bot.send_message(
-        message.chat.id,
-        "⏳ Kurs ishi bo‘yicha ilmiy material tayyorlanmoqda, birozdan keyin natija chiqadi...",
-    )
-
-    lang = get_user_language(tg_id)
-
-    prompt = (
-        "Create a detailed course paper structure and main text for the following topic.\n\n"
-        f"Topic: {topic}\n\n"
-        "Requirements:\n"
-        "- Include: introduction, 2–3 chapters in the main part, and conclusion.\n"
-        "- Each chapter should have sub-sections, theoretical analysis and practical examples.\n"
-        "- Style: academic, clear, without plagiarism, suitable for university level.\n"
-        "- Do not add any extra explanations, just the course paper text."
-    )
-    answer = ask_gpt(prompt, lang)
-    bot.send_message(message.chat.id, answer)
-
-
-@bot.message_handler(func=lambda m: m.text == "📄 Mustaqil ish / Referat")
-def handle_mustaqil(message: telebot.types.Message):
-    ensure_user(message.from_user)
-    tg_id = message.from_user.id
-    user_states[tg_id] = {"mode": "mustaqil_step_pages"}
-
-    bot.send_message(
-        message.chat.id,
-        f"📄 Mustaqil ish / referat uchun taxminiy *betlar sonini* kiriting (1–{MAX_LIST_SLAYD}):",
-    )
-
-
-@bot.message_handler(
-    func=lambda m: user_states.get(m.from_user.id, {}).get("mode") == "mustaqil_step_pages"
-)
-def process_mustaqil_pages(message: telebot.types.Message):
-    tg_id = message.from_user.id
-    state = user_states.get(tg_id, {})
-
-    try:
-        pages = int(message.text.strip())
-    except ValueError:
-        bot.send_message(message.chat.id, "❗️ Iltimos, faqat son kiriting. Masalan: 10")
-        return
-
-    if pages < 1 or pages > MAX_LIST_SLAYD:
-        bot.send_message(
-            message.chat.id,
-            f"❗️ Betlar soni 1 dan {MAX_LIST_SLAYD} gacha bo‘lishi kerak.",
-        )
-        return
-
-    state["pages"] = pages
-    state["mode"] = "mustaqil_step_topic"
-    user_states[tg_id] = state
-
-    bot.send_message(
-        message.chat.id,
-        "Endi mustaqil ish / referat *mavzusini batafsil* yozib yuboring:",
-    )
-
-
-@bot.message_handler(
-    func=lambda m: user_states.get(m.from_user.id, {}).get("mode") == "mustaqil_step_topic"
-)
-def process_mustaqil_topic(message: telebot.types.Message):
-    tg_id = message.from_user.id
-    state = user_states.get(tg_id, {})
-    pages = state.get("pages", 10)
-    topic = message.text
-
-    ensure_user(message.from_user)
-
-    ok, _src = consume_credit(tg_id)
-    if not ok:
-        bot.send_message(
-            message.chat.id,
-            "❗️ Sizda bepul yoki to‘langan foydalanishlar qolmadi.\n"
-            "Iltimos, *To‘lov / Hisob* bo‘limi orqali balansni to‘ldiring "
-            "yoki *Referal bonus* bo‘limi orqali bepul foydalanish oling.",
-        )
-        user_states.pop(tg_id, None)
-        return
-
-    bot.send_message(
-        message.chat.id,
-        "⏳ Mustaqil ish / referat tayyorlanmoqda, birozdan keyin natija chiqadi...",
-    )
-
-    lang = get_user_language(tg_id)
-
-    prompt = (
-        "Write an independent work / referat for the following topic.\n\n"
-        f"Topic: {topic}\n"
-        f"Approximate length: {pages} pages (A4).\n\n"
-        "Structure:\n"
-        "- Introduction\n"
-        "- 2–3 main chapters with subheadings\n"
-        "- Conclusion\n\n"
-        "Style: academic, clear, logically structured. No plagiarism. "
-        "Return only the text of the paper, without any extra commentary."
-    )
-
-    text = ask_gpt(prompt, lang)
-
-    # Telegram limitiga urilmaslik uchun birinchi 4000 belgini chatga yuboramiz
-    bot.send_message(message.chat.id, text[:4000])
-
-    filename = os.path.join(BASE_DIR, f"mustaqil_{tg_id}.docx")
-    try:
-        create_docx_from_text(text, filename, title=topic)
-        with open(filename, "rb") as f:
-            bot.send_document(
-                message.chat.id,
-                f,
-                visible_file_name=f"Mustaqil_ish_{tg_id}.docx",
-                caption="📄 Mustaqil ish / referat DOCX fayli tayyor.",
-            )
-    except Exception as e:
-        print("DOCX yaratish xatosi:", e)
-        bot.send_message(
-            message.chat.id,
-            "❗️ DOCX fayl yaratishda xatolik yuz berdi. Matnni qo‘lda nusxa ko‘chirib Word faylga joylashtirishingiz mumkin.",
-        )
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
-
-    user_states.pop(tg_id, None)
-
-
-# ============================
-#   SLAYD (PPTX)
-# ============================
-
-@bot.message_handler(func=lambda m: m.text == "📝 Slayd")
-def handle_slayd(message: telebot.types.Message):
-    ensure_user(message.from_user)
-
-    kb = types.InlineKeyboardMarkup()
-    buttons = []
-    for i in range(1, 7):
-        btn = types.InlineKeyboardButton(
-            f"🎨 Dizayn {i}", callback_data=f"slayd_design_{i}"
-        )
-        buttons.append(btn)
-
-    kb.add(buttons[0], buttons[1])
-    kb.add(buttons[2], buttons[3])
-    kb.add(buttons[4], buttons[5])
-
-    bot.send_message(
-        message.chat.id,
-        "🎓 *Slayd generatori*\n\n"
-        f"1️⃣ Avval dizaynni tanlang.\n"
-        f"2️⃣ Keyin slaydlar sonini kiriting (1–{MAX_LIST_SLAYD}).\n"
-        "3️⃣ So‘ng mavzuni yozing – AI siz uchun ta’limga mos slayd matnini tuzib beradi.\n\n"
-        "Yangi foydalanuvchi uchun *1 marta bepul*, keyingi har bir slayd (20 listgacha) "
-        f"narxi: *{PRICE_PER_USE} so'm*.\n\n"
-        "Quyidagi dizaynlardan birini tanlang 👇",
-    )
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("slayd_design_"))
-def callback_slayd_design(call: telebot.types.CallbackQuery):
-    design = call.data.split("_")[-1]
-    tg_id = call.from_user.id
-
-    user_states[tg_id] = {"mode": "slayd_step_lists", "design": design}
-
-    bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        f"✅ *Dizayn {design}* tanlandi.\n"
-        f"Endi necha listli slayd kerak? (1–{MAX_LIST_SLAYD} oralig‘ida son kiriting):",
-    )
-
-
-@bot.message_handler(
-    func=lambda m: user_states.get(m.from_user.id, {}).get("mode") == "slayd_step_lists"
-)
-def process_slayd_lists(message: telebot.types.Message):
-    tg_id = message.from_user.id
-    state = user_states.get(tg_id)
-
-    try:
-        lists = int(message.text.strip())
-    except ValueError:
-        bot.send_message(
-            message.chat.id,
-            "❗️ Iltimos, faqat son kiriting. Masalan: 10",
-        )
-        return
-
-    if lists < 1 or lists > MAX_LIST_SLAYD:
-        bot.send_message(
-            message.chat.id,
-            f"❗️ Listlar soni 1 dan {MAX_LIST_SLAYD} gacha bo'lishi kerak.",
-        )
-        return
-
-    state["lists"] = lists
-    state["mode"] = "slayd_step_topic"
-    user_states[tg_id] = state
-
-    bot.send_message(
-        message.chat.id,
-        "✍️ Endi slayd *mavzusini* batafsil yozib yuboring:",
-    )
-
-
-@bot.message_handler(
-    func=lambda m: user_states.get(m.from_user.id, {}).get("mode") == "slayd_step_topic"
-)
-def process_slayd_topic(message: telebot.types.Message):
-    tg_id = message.from_user.id
-    state = user_states.get(tg_id)
-
-    if not state:
-        bot.send_message(
-            message.chat.id,
-            "Avval 📝 Slayd menyusidan dizayn va list sonini tanlang.",
-        )
-        return
-
-    topic = message.text
-    design = state["design"]
-    lists = state["lists"]
-
-    ensure_user(message.from_user)
-
-    ok, _src = consume_credit(tg_id)
-    if not ok:
-        bot.send_message(
-            message.chat.id,
-            "❗️ Sizda bepul yoki to‘langan foydalanishlar qolmadi.\n"
-            "Iltimos, *To‘lov / Hisob* bo‘limi orqali balansni to‘ldiring "
-            "yoki *Referal bonus* bo‘limi orqali bepul foydalanish oling.",
-        )
-        user_states.pop(tg_id, None)
-        return
-
-    bot.send_message(
-        message.chat.id,
-        "⏳ Slayd uchun matn va PPTX fayl tayyorlanmoqda, birozdan keyin natija chiqadi...",
-    )
-
-    lang = get_user_language(tg_id)
-
-    prompt = (
-        "Generate presentation slide content with the following parameters:\n\n"
-        f"- Topic: {topic}\n"
-        f"- Number of slides: {lists}\n"
-        f"- Design style code: {design} (use it as a style hint only).\n\n"
-        "For each slide, include:\n"
-        "- Short clear title\n"
-        "- 3–6 bullet points with key ideas\n"
-        "- Examples or brief explanations if useful\n\n"
-        "Separate each slide as: SLIDE 1, SLIDE 2, etc.\n"
-        "Do not add any extra commentary outside the slide texts."
-    )
-
-    text = ask_gpt(prompt, lang)
-
-    bot.send_message(message.chat.id, text[:4000])
-
-    filename = os.path.join(BASE_DIR, f"slayd_{tg_id}.pptx")
-    try:
-        create_pptx_from_text(text, design, filename)
-        with open(filename, "rb") as f:
-            bot.send_document(
-                message.chat.id,
-                f,
-                visible_file_name=f"Slayd_{tg_id}.pptx",
-                caption="📊 Slayd PPTX fayli tayyor.",
-            )
-    except Exception as e:
-        print("PPTX yaratish xatosi:", e)
-        bot.send_message(
-            message.chat.id,
-            "❗️ PPTX fayl yaratishda xatolik yuz berdi. Matnni qo‘lda nusxa ko‘chirib "
-            "PowerPoint’ga joylashtirishingiz mumkin.",
-        )
-    finally:
-        if os.path.exists(filename):
-            os.remove(filename)
-
-    user_states.pop(tg_id, None)
-
-
-# ============================
-#   DEFAULT HANDLER
-# ============================
-
-@bot.message_handler(content_types=["text"])
-def default_handler(message: telebot.types.Message):
-    if message.text.startswith("/"):
-        bot.send_message(
-            message.chat.id,
-            "Bu buyruq tushunarsiz. Asosiy menyudan foydalaning 👇",
-            reply_markup=main_menu_keyboard(message.from_user.id),
-        )
-    else:
-        bot.send_message(
-            message.chat.id,
-            "Kerakli bo'limni menyudan tanlang 👇",
-            reply_markup=main_menu_keyboard(message.from_user.id),
-        )
-
-
-# ============================
-#   BOTNI ISHGA TUSHIRISH
-# ============================
-
-if __name__ == "__main__":
-    print("Bot ishga tushdi...")
-    # Har ehtimolga qarshi webhook'ni o'chiramiz, shunda polling xatosiz ishlaydi
-    try:
-        bot.remove_webhook()
-    except Exception as e:
-        print("Webhookni o‘chirishda xato:", e)
-
-    bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">
+                <i class="fas fa-fire"></i>
+                <h1>Red deploy</h1>
+            </div>
+            <div class="weather">
+                <i class="fas fa-cloud"></i>
+                <span>4°C Mostly cloudy</span>
+            </div>
+        </header>
+        
+        <div class="main-content">
+            <div class="sidebar">
+                <div class="section-title">
+                    <i class="fas fa-sitemap"></i>
+                    <span>Architecture</span>
+                </div>
+                <ul class="architecture-list">
+                    <li>Observability</li>
+                    <li>Logs</li>
+                    <li>Settings</li>
+                    <li>
+                        <span>30 days left</span>
+                        <span class="badge">$4.99</span>
+                    </li>
+                </ul>
+                
+                <hr>
+                
+                <div class="chat-preview">
+                    <div class="chat-header">
+                        <span>TDTru Studentlari → Shokhr...</span>
+                        <span>12:45 PM</span>
+                    </div>
+                    <div class="chat-message">
+                        Allayor: Assalomu alaykum Qadri baland qadrdonlarim Sizga ...
+                    </div>
+                </div>
+            </div>
+            
+            <div class="deployments">
+                <div class="deployment-header">
+                    <h2 class="section-title">Deployments</h2>
+                </div>
+                
+                <div class="deployment-card">
+                    <div class="deployment-time">
+                        <i class="fab fa-github"></i>
+                        <span>5 hours ago via GitHub</span>
+                        <span class="status-badge active">ACTIVE</span>
+                    </div>
+                    
+                    <div class="deployment-status success">
+                        <i class="fas fa-check-circle"></i>
+                        <span>Deployment successful</span>
+                    </div>
+                    
+                    <a href="#" class="btn">
+                        <i class="fas fa-file-alt"></i>
+                        View logs
+                    </a>
+                </div>
+                
+                <h2 class="section-title" style="margin-top: 40px;">History</h2>
+                
+                <div class="deployment-card">
+                    <div class="deployment-time">
+                        <i class="fab fa-github"></i>
+                        <span>Update requirements.txt</span>
+                        <span class="status-badge failed">FAILED</span>
+                    </div>
+                    <div class="deployment-time">
+                        <i class="far fa-clock"></i>
+                        <span>1 minute ago via GitHub</span>
+                    </div>
+                    
+                    <div class="deployment-status failure">
+                        <i class="fas fa-exclamation-circle"></i>
+                        <span>Deployment failed during build process</span>
+                        <span class="step-time">(00:24)</span>
+                    </div>
+                    
+                    <div class="build-steps">
+                        <div class="build-step neutral">
+                            Initialization
+                            <span class="step-time">(00:00)</span>
+                        </div>
+                        <div class="build-step failed">
+                            Build > Build image
+                            <span class="step-time">(00:05)</span>
+                        </div>
+                    </div>
+                    
+                    <div class="error-details">
+                        <i class="fas fa-exclamation-triangle"></i>
+                        Failed to build an image. Please check the build logs for more details.
+                        <br>
+                        Install site packages: python secret ADMIN_ID not found
+                    </div>
+                    
+                    <a href="#" class="btn" style="margin-top: 20px;">
+                        <i class="fas fa-file-alt"></i>
+                        View logs
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <footer>
+            <p>Red Deploy Dashboard • v2.1.4 • © 2023 All rights reserved</p>
+        </footer>
+    </div>
+
+    <script>
+        // Add interactivity for buttons
+        document.querySelectorAll('.btn').forEach(button => {
+            button.addEventListener('click', function(e) {
+                e.preventDefault();
+                const deploymentType = this.closest('.deployment-card').querySelector('.status-badge').textContent;
+                alert(`Viewing logs for ${deploymentType} deployment...`);
+            });
+        });
+        
+        // Simulate real-time update for the failed deployment time
+        function updateTime() {
+            const timeElement = document.querySelector('.deployment-time:nth-child(2) span:nth-child(2)');
+            const now = new Date();
+            const minutesAgo = Math.floor(Math.random() * 5) + 1;
+            timeElement.textContent = `${minutesAgo} minute${minutesAgo > 1 ? 's' : ''} ago via GitHub`;
+        }
+        
+        // Update time every minute
+        setInterval(updateTime, 60000);
+        
+        // Weather update simulation
+        const weatherElement = document.querySelector('.weather span');
+        const weatherConditions = ['Mostly cloudy', 'Partly sunny', 'Light rain', 'Clear'];
+        const temperatures = [3, 4, 5, 6, 7];
+        
+        function updateWeather() {
+            const randomTemp = temperatures[Math.floor(Math.random() * temperatures.length)];
+            const randomCondition = weatherConditions[Math.floor(Math.random() * weatherConditions.length)];
+            weatherElement.textContent = `${randomTemp}°C ${randomCondition}`;
+        }
+        
+        // Update weather every 5 minutes
+        setInterval(updateWeather, 300000);
+    </script>
+</body>
+</html>
