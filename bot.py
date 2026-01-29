@@ -30,7 +30,7 @@ from docx import Document
 # ============================
 
 # ⚠️ BU YERGA O'ZINGNING BOTFATHER TOKENINGNI YOZ!
-BOT_TOKEN = "8552375519:AAFIBEd_cQgGAkALULJRriYdpUFob6KQz78"
+BOT_TOKEN = "8552375519:AAF8Q5iRpYaNkgsVfoY55LWuNlM1_oMbmag"
 
 # OpenAI kaliti – Railway / env orqali beriladi
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -1315,3 +1315,4 @@ def default_handler(message: telebot.types.Message):
 if __name__ == "__main__":
     print("Bot ishga tushdi...")
     bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+
