@@ -1298,5 +1298,10 @@ def default_handler(message: telebot.types.Message):
 
 if __name__ == "__main__":
     print("Bot ishga tushdi...")
-    # infinity_polling – serverda doimiy ishlashi uchun
+    # Har ehtimolga qarshi webhook'ni o'chiramiz, shunda polling xatosiz ishlaydi
+    try:
+        bot.remove_webhook()
+    except Exception as e:
+        print("Webhookni o‘chirishda xato:", e)
+
     bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
