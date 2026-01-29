@@ -1,4 +1,4 @@
 pyTelegramBotAPI
-openai
-python-pptx
-python-docx
+openai==1.12.0
+python-dotenv
+requests
