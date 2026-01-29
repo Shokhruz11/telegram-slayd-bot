@@ -13,7 +13,7 @@ from docx import Document
 #  SOZLAMALAR (ENV DAN)
 # ===========================
 
-BOT_TOKEN = os.getenv("8086850400:AAHUpWbBtn9Bl_PMQgYOlf5OlmC-NBB2z30")  # Railway Shared Variables
+BOT_TOKEN = os.getenv("8552375519:AAGaLiTyCeiNH1sKmSqOyJo00Lc7ifYhLZw")  # Railway Shared Variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # OpenAI API key
 ADMIN_ID = os.getenv("ADMIN_ID")  # ixtiyoriy
 CARD_NUMBER = os.getenv("CARD_NUMBER", "4790 9200 1858 5070")
@@ -483,4 +483,5 @@ if __name__ == "__main__":
     init_db()
     print("🚀 Bot ishga tushdi")
     bot.polling(none_stop=True, interval=0, timeout=20)
+
 
