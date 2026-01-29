@@ -22,7 +22,7 @@ from docx import Document
 #   ENV SOZLAMALAR
 # ============================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("8552375519:AAFIBEd_cQgGAkALULJRriYdpUFob6KQz78")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Bot username: t.me/USERNAME dagi USERNAME (@sizisiz)
@@ -1302,3 +1302,4 @@ def default_handler(message: telebot.types.Message):
 if __name__ == "__main__":
     print("Bot ishga tushdi...")
     bot.infinity_polling(skip_pending=True)
+
