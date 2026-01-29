@@ -10,8 +10,6 @@ import requests
 #   ENV SOZLAMALAR
 # ============================
 
-# Railway/Render yoki lokal .env da beriladigan qiymatlar:
-# BOT_TOKEN, DEEPSEEK_API_KEY, BOT_USERNAME, ADMIN_ID
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
@@ -291,6 +289,7 @@ def get_referral_info_text(tg_id: int) -> str:
 def ask_deepseek(prompt: str) -> str:
     """
     DeepSeek chat API orqali javob olish.
+    Xatolik bo'lsa, Railway loglariga status va matnni chiqaradi.
     """
     if not DEEPSEEK_API_KEY:
         return (
@@ -311,8 +310,7 @@ def ask_deepseek(prompt: str) -> str:
                 "content": (
                     "Sen talabalarga slayd, mustaqil ish, referat, kurs ishi, test va boshqa "
                     "ilmiy ishlar bo‘yicha matn tayyorlab beradigan TA’LIMIY yordamchi botsan. "
-                    "Matnlar O‘zbekiston oliy va o‘rta maxsus ta’lim standartlariga mos, "
-                    "tushunarli, plagiatsiz va ilmiy-uslubda bo‘lsin."
+                    "Matnlar O‘zbekiston ta’lim standartlariga mos, plagiatsiz va ilmiy-uslubda bo‘lsin."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -320,12 +318,32 @@ def ask_deepseek(prompt: str) -> str:
     }
 
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=60)
-        response.raise_for_status()
-        res_json = response.json()
+        resp = requests.post(url, headers=headers, json=data, timeout=60)
+
+        if resp.status_code != 200:
+            # Logga yozamiz
+            print("DeepSeek HTTP xato:", resp.status_code, resp.text)
+
+            if resp.status_code in (401, 403):
+                return "❗️ DeepSeek API kaliti noto‘g‘ri yoki ruxsat berilmagan. Admin kalitni tekshirishi kerak."
+            if resp.status_code in (402, 429):
+                return "❗️ DeepSeek API limiti yoki balans tugagan. Admin uni to‘ldirishi kerak."
+            if resp.status_code == 404:
+                return "❗️ DeepSeek API manzili topilmadi (URL yoki model noto‘g‘ri bo‘lishi mumkin)."
+            if 500 <= resp.status_code < 600:
+                return "❗️ DeepSeek serverida texnik nosozlik. Birozdan keyin yana urinib ko‘ring."
+
+            return "❗️ DeepSeek API tomondan xatolik yuz berdi. Keyinroq yana urinib ko‘ring."
+
+        res_json = resp.json()
         return res_json["choices"][0]["message"]["content"]
+
+    except requests.exceptions.Timeout:
+        print("DeepSeek timeout xatosi")
+        return "❗️ DeepSeek serveri vaqtida javob bermadi. Keyinroq yana urinib ko‘ring."
+
     except Exception as e:
-        print("DeepSeek xatosi:", e)
+        print("DeepSeek umumiy xato:", e)
         return "❗️ AI xizmatida kutilmagan xatolik yuz berdi. Birozdan so‘ng qayta urinib ko‘ring."
 
 
@@ -422,10 +440,6 @@ def cmd_help(message: telebot.types.Message):
 
 @bot.message_handler(commands=["chek"])
 def cmd_chek(message: telebot.types.Message):
-    """
-    Foydalanuvchi to'lov chek ma'lumotini yuborishi uchun.
-    Asosiy variant – screenshot (rasm), xohlasa matn ham bo'lishi mumkin.
-    """
     bot.send_message(
         message.chat.id,
         "🧾 *To'lov cheki*\n\n"
@@ -477,7 +491,7 @@ def process_chek_message(message: telebot.types.Message):
         bot.send_message(
             message.chat.id,
             "❗️ Chek ma'lumotini admin ga yuborishda xatolik yuz berdi. "
-            "Iltimos, keyinroq qayta urinib ko‘ring.",
+            "Keyinroq qayta urinib ko‘ring.",
         )
 
 
@@ -653,7 +667,7 @@ def process_kurs_ishi_topic(message: telebot.types.Message):
 
     bot.send_message(
         message.chat.id,
-        "⏳ Kurs ishi bo‘yicha ilmiy material tayyorlanmoqda, biroz kuting...",
+        "⏳ Kurs ishi bo‘yicha ilmiy material tayyorlanmoqda, birozdan keyin natija chiqadi...",
     )
 
     prompt = (
@@ -787,7 +801,7 @@ def process_slayd_topic(message: telebot.types.Message):
 
     bot.send_message(
         message.chat.id,
-        "⏳ Slayd uchun matn tayyorlanmoqda, biroz kuting...",
+        "⏳ Slayd uchun matn tayyorlanmoqda, birozdan keyin natija chiqadi...",
     )
 
     prompt = (
