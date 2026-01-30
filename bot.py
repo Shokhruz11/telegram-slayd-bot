@@ -23,7 +23,7 @@ from datetime import datetime
 
 import telebot
 from telebot import types
-from openai import OpenAI
+import openai
 
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -64,7 +64,9 @@ MAX_PAGES_PER_ORDER = 20
 DB_NAME = "bot_db.sqlite3"
 FILES_DIR = "generated_files"
 
-# OpenAI klient
+# # OpenAI klient
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # TeleBot (parse_mode bermaymiz, oddiy matn)
@@ -79,22 +81,22 @@ user_context = {}  # chat_id -> dict
 #      YORDAMCHI FUNKSIYALAR
 # ============================
 
-def init_db():
-    """SQLite bazasini yaratish."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-
-    # Foydalanuvchilar
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id INTEGER UNIQUE,
-            username TEXT,
-            full_name TEXT,
-            free_used INTEGER DEFAULT 0,
-            created_at TEXT
+def ask_gpt(prompt: str, max_tokens: int = 2048) -> str:
+    """GPT-4o-mini bilan matn generatsiyasi."""
+    try:
+        completion = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Sen talabalarga ilmiy-uslubda yordam beradigan yordamchi bo'lasan."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=max_tokens,
         )
-    """)
+        # eski API uslubi: message["content"]
+        return completion.choices[0].message["content"]
+    except Exception as e:
+        print("OpenAI xatosi:", e)
+        return f"ERROR: {e}"
 
     # Buyurtmalar
     c.execute("""
@@ -802,3 +804,4 @@ if __name__ == "__main__":
     init_db()
     ensure_files_dir()
     bot.infinity_polling(skip_pending=True)
+
