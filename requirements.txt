@@ -1,3 +1,5 @@
-git add .
-git commit -m "Full optimized bot with payments and Gemini"
-git push
+pyTelegramBotAPI==4.16.1
+google-genai
+python-pptx
+python-docx
+Pillow
