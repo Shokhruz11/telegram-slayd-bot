@@ -1,2 +1,4 @@
 pyTelegramBotAPI==4.16.1
 google-generativeai
+python-pptx
+python-docx
